@@ -1,0 +1,91 @@
+---
+schemaVersion: "2.2"
+description: |
+  Environment-safe shell script execution. Validates the instance's
+  Environment tag before running commands. Refuses execution on instances
+  tagged as PROD, production, or prod, or instances with no Environment tag.
+
+  Use this document instead of AWS-RunShellScript for all agentic tool access.
+
+  Created as part of PROD incident response guardrail implementation.
+  See: POST-MORTEM.md
+
+parameters:
+  commands:
+    type: StringList
+    description: "Shell commands to execute (same as AWS-RunShellScript)"
+  workingDirectory:
+    type: String
+    default: ""
+    description: "Working directory for command execution"
+  executionTimeout:
+    type: String
+    default: "3600"
+    description: "Timeout in seconds"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: ValidateEnvironment
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: "30"
+      runCommand:
+        - |
+          #!/bin/bash
+          set -euo pipefail
+
+          echo "=== Environment Validation ==="
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Get instance ID from IMDS v2
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 30")
+          INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/instance-id)
+          REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/placement/region)
+
+          echo "Instance ID: $INSTANCE_ID"
+          echo "Region: $REGION"
+
+          # Query Environment tag via IMDS (no AWS CLI required)
+          ENV_TAG=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/tags/instance/Environment 2>/dev/null || echo "QUERY_FAILED")
+          # Treat HTTP error responses as missing
+          if echo "$ENV_TAG" | grep -qi "404\|not found\|error"; then ENV_TAG="QUERY_FAILED"; fi
+
+          echo "Environment tag: $ENV_TAG"
+
+          # Validate environment
+          ENV_LOWER=$(echo "$ENV_TAG" | tr '[:upper:]' '[:lower:]')
+
+          if [[ "$ENV_LOWER" == "prod" || "$ENV_LOWER" == "production" ]]; then
+            echo "BLOCKED: Instance is tagged as PRODUCTION ($ENV_TAG)"
+            echo "This document refuses to execute commands on production instances."
+            echo "Use AWS-RunShellScript with proper authorization for production access."
+            exit 1
+          fi
+
+          if [[ "$ENV_TAG" == "None" || "$ENV_TAG" == "QUERY_FAILED" || -z "$ENV_TAG" ]]; then
+            echo "BLOCKED: Instance has no Environment tag or tag query failed"
+            echo "Untagged instances are treated as PRODUCTION by default."
+            echo "Add an Environment tag (e.g., Environment=UAT) to enable command execution."
+            exit 1
+          fi
+
+          echo "APPROVED: Environment=$ENV_TAG — proceeding with command execution"
+          echo "=== End Validation ==="
+
+  - action: aws:runShellScript
+    name: ExecuteCommands
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: "{{ executionTimeout }}"
+      workingDirectory: "{{ workingDirectory }}"
+      runCommand: "{{ commands }}"

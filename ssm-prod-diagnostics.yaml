@@ -1,0 +1,225 @@
+---
+schemaVersion: "2.2"
+description: |
+  PROD-only read-only diagnostics. Allows safe commands (tail, cat, grep,
+  git log, ps, df, bench doctor, etc.) while blocking write operations
+  (bench migrate/restart, git checkout/push, rm, mv, sed -i, service control, etc.).
+
+  This document ONLY executes on instances tagged Environment=PROD.
+  For UAT instances, use AcmeCo-SafeRunShellScript instead.
+
+  Created as part of PROD incident response guardrail implementation.
+  See: POST-MORTEM.md
+
+parameters:
+  commands:
+    type: String
+    description: "Read-only diagnostic command(s) to execute on PROD. Separate multiple commands with semicolons."
+  workingDirectory:
+    type: String
+    default: ""
+    description: "Working directory for command execution"
+  executionTimeout:
+    type: String
+    default: "300"
+    description: "Timeout in seconds (default 5 min, max for diagnostics)"
+
+mainSteps:
+  - action: aws:runShellScript
+    name: ValidateEnvironmentIsPROD
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: "30"
+      runCommand:
+        - |
+          #!/bin/bash
+          set -euo pipefail
+
+          echo "=== PROD Diagnostics — Environment Validation ==="
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # Get instance ID from IMDS v2
+          TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 30")
+          INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/instance-id)
+          REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/placement/region)
+
+          echo "Instance ID: $INSTANCE_ID"
+          echo "Region: $REGION"
+
+          # Query Environment tag via IMDS (no AWS CLI required)
+          ENV_TAG=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+            http://169.254.169.254/latest/meta-data/tags/instance/Environment 2>/dev/null || echo "QUERY_FAILED")
+          # Treat HTTP error responses as missing
+          if echo "$ENV_TAG" | grep -qi "404\|not found\|error"; then ENV_TAG="QUERY_FAILED"; fi
+
+          echo "Environment tag: $ENV_TAG"
+          ENV_LOWER=$(echo "$ENV_TAG" | tr '[:upper:]' '[:lower:]')
+
+          # This document is ONLY for PROD — reject non-PROD instances
+          if [[ "$ENV_LOWER" != "prod" && "$ENV_LOWER" != "production" ]]; then
+            echo "BLOCKED: This document is for PROD diagnostics only."
+            echo "Instance is tagged '$ENV_TAG' — use AcmeCo-SafeRunShellScript for non-PROD instances."
+            exit 1
+          fi
+
+          echo "CONFIRMED: Instance is PROD ($ENV_TAG) — proceeding to command validation"
+          echo "=== End Environment Validation ==="
+
+  - action: aws:runShellScript
+    name: ValidateCommandsSafe
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: "30"
+      runCommand:
+        - |
+          #!/bin/bash
+          set -euo pipefail
+
+          echo "=== PROD Diagnostics — Command Safety Validation ==="
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # The commands parameter is passed as a single string by SSM
+          # We validate the full command text against forbidden patterns
+          COMMANDS="{{ commands }}"
+
+          echo "Commands to validate:"
+          echo "$COMMANDS"
+          echo ""
+
+          BLOCKED=0
+          REASON=""
+
+          # -------------------------------------------------------
+          # FORBIDDEN: Frappe bench write operations
+          # -------------------------------------------------------
+          if echo "$COMMANDS" | grep -qiE 'bench\s+(migrate|restart|update|setup|install|new-site|drop-site|build|clear-cache|clear-website-cache|reload-doc|set-config|enable-scheduler|disable-scheduler)'; then
+            BLOCKED=1
+            REASON="Frappe bench write operation detected"
+          fi
+
+          # -------------------------------------------------------
+          # FORBIDDEN: git write operations
+          # -------------------------------------------------------
+          if echo "$COMMANDS" | grep -qiE 'git\s+(checkout|merge|reset|pull|fetch|push|rebase|cherry-pick|revert|stash|clean|init|clone|commit|tag\s+-d|branch\s+-(d|D|m|M))'; then
+            BLOCKED=1
+            REASON="git write operation detected"
+          fi
+
+          # -------------------------------------------------------
+          # FORBIDDEN: filesystem write operations
+          # -------------------------------------------------------
+          if echo "$COMMANDS" | grep -qiE '(^|\s|;|&&|\|\|)(rm|rmdir|mv|cp|mkdir|touch|chmod|chown|chgrp|ln|install|mkfifo|mknod)\s'; then
+            BLOCKED=1
+            REASON="Filesystem write operation detected"
+          fi
+
+          # -------------------------------------------------------
+          # FORBIDDEN: in-place file editing
+          # -------------------------------------------------------
+          if echo "$COMMANDS" | grep -qiE '(sed\s+-i|perl\s+-i|ed\s+|ex\s+|vi\s+|vim\s+|nano\s+)'; then
+            BLOCKED=1
+            REASON="In-place file editing detected"
+          fi
+
+          # -------------------------------------------------------
+          # FORBIDDEN: output redirection (writing to files)
+          # -------------------------------------------------------
+          if echo "$COMMANDS" | grep -qE '(>\s|>>|[^2]>\s|&>|\btee\b)'; then
+            BLOCKED=1
+            REASON="Output redirection / tee detected (writes to files)"
+          fi
+
+          # -------------------------------------------------------
+          # FORBIDDEN: package management
+          # -------------------------------------------------------
+          if echo "$COMMANDS" | grep -qiE '(pip|pip3)\s+(install|uninstall)|npm\s+(install|uninstall|ci)|apt(-get)?\s+(install|remove|purge|upgrade)|yum\s+(install|remove|erase|update)'; then
+            BLOCKED=1
+            REASON="Package management operation detected"
+          fi
+
+          # -------------------------------------------------------
+          # FORBIDDEN: service/process control
+          # -------------------------------------------------------
+          if echo "$COMMANDS" | grep -qiE 'systemctl\s+(start|stop|restart|enable|disable|reload|mask|unmask|daemon-reload)'; then
+            BLOCKED=1
+            REASON="systemctl write operation detected"
+          fi
+
+          if echo "$COMMANDS" | grep -qiE 'supervisorctl\s+(start|stop|restart|reload|reread|update|add|remove|clear)'; then
+            BLOCKED=1
+            REASON="supervisorctl write operation detected"
+          fi
+
+          if echo "$COMMANDS" | grep -qiE '(^|\s|;|&&|\|\|)(kill|pkill|killall)\s'; then
+            BLOCKED=1
+            REASON="Process kill operation detected"
+          fi
+
+          # -------------------------------------------------------
+          # FORBIDDEN: cron modification
+          # -------------------------------------------------------
+          if echo "$COMMANDS" | grep -qiE 'crontab\s+-(e|r|l\s*\|)'; then
+            BLOCKED=1
+            REASON="Crontab modification detected"
+          fi
+
+          # -------------------------------------------------------
+          # FORBIDDEN: destructive database operations
+          # -------------------------------------------------------
+          if echo "$COMMANDS" | grep -qiE '(DROP|DELETE|TRUNCATE|ALTER|INSERT|UPDATE|CREATE|REPLACE)\s'; then
+            BLOCKED=1
+            REASON="Database write SQL detected"
+          fi
+
+          # -------------------------------------------------------
+          # FORBIDDEN: dangerous utilities
+          # -------------------------------------------------------
+          if echo "$COMMANDS" | grep -qiE '(^|\s|;|&&|\|\|)(dd|truncate|shred|wipefs|mkfs|fdisk|parted)\s'; then
+            BLOCKED=1
+            REASON="Dangerous disk utility detected"
+          fi
+
+          if [[ "$BLOCKED" -eq 1 ]]; then
+            echo ""
+            echo "BLOCKED: $REASON"
+            echo ""
+            echo "This document only allows read-only diagnostic commands on PROD."
+            echo "Allowed examples: tail, cat, head, grep, ls, find, ps, df, free,"
+            echo "  git log, git status, git diff, git branch, bench doctor,"
+            echo "  bench --version, supervisorctl status, systemctl status,"
+            echo "  mysql -e 'SELECT ...', journalctl, netstat, ss, ip addr"
+            echo ""
+            echo "If you need to run a write operation on PROD, coordinate with"
+            echo "the infrastructure team for a change control window."
+            exit 1
+          fi
+
+          echo "APPROVED: All commands passed safety validation"
+          echo "=== End Command Validation ==="
+
+  - action: aws:runShellScript
+    name: ExecuteDiagnostics
+    precondition:
+      StringEquals:
+        - platformType
+        - Linux
+    inputs:
+      timeoutSeconds: "{{ executionTimeout }}"
+      workingDirectory: "{{ workingDirectory }}"
+      runCommand:
+        - |
+          echo "=== PROD Diagnostics — Execution ==="
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo ""
+          eval "{{ commands }}"
+          echo ""
+          echo "=== End PROD Diagnostics ==="
