@@ -36,7 +36,7 @@ This is also a post about one of the most important truths in platform engineeri
 
 Here is the short version.
 
-An AI coding agent was working on a MySQL 8.0 compatibility issue in a Frappe/ERPNext workload. The plan was sensible enough:
+An AI coding agent was working on a MySQL 8.0 compatibility issue in an open-source ERP workload that only supported MariaDB. The plan was sensible enough:
 
 1. identify the issue
 2. push the fix branch
@@ -364,7 +364,7 @@ mainSteps:
 aws ssm send-command \
   --document-name AcmeCo-SafeRunShellScript \
   --instance-ids i-0a1b2c3d4e5f60003 \
-  --parameters 'commands=["hostname","cd /home/acmeco/frappe-bench && sudo -u acmeco bench --site erp.uat.example.com migrate"]' \
+  --parameters 'commands=["hostname","cd /home/acmeco/bench && sudo -u acmeco bench --site erp.uat.example.com migrate"]' \
   --profile AcmeCo-PROD \
   --region us-west-1
 ```
@@ -445,7 +445,7 @@ mainSteps:
           COMMANDS="{{ commands }}"
 
           if echo "$COMMANDS" | grep -qiE 'bench\s+(migrate|restart|update|setup|install|build)'; then
-            echo "BLOCKED: Frappe bench write operation detected"
+            echo "BLOCKED: Bench write operation detected"
             exit 1
           fi
 
@@ -491,7 +491,7 @@ aws ssm send-command \
 aws ssm send-command \
   --document-name AcmeCo-ProdDiagnostics \
   --instance-ids i-0a1b2c3d4e5f60001 \
-  --parameters 'commands=cd /home/acmeco/frappe-bench/apps/acmeco_erp && git log --oneline -10' \
+  --parameters 'commands=cd /home/acmeco/bench/apps/acmeco_erp && git log --oneline -10' \
   --profile AcmeCo-PROD \
   --region us-west-1
 ```
@@ -647,7 +647,7 @@ fi
 COMMAND_ID=$(aws ssm send-command \
   --instance-ids "$INSTANCE_ID" \
   --document-name AWS-RunShellScript \
-  --parameters "commands=[\"cd /home/acmeco/frappe-bench/apps/acmeco_erp && sudo -u acmeco git checkout $TARGET_BRANCH && sudo -u acmeco git log --oneline -5\",\"cd /home/acmeco/frappe-bench && sudo -u acmeco bench restart\"]" \
+  --parameters "commands=[\"cd /home/acmeco/bench/apps/acmeco_erp && sudo -u acmeco git checkout $TARGET_BRANCH && sudo -u acmeco git log --oneline -5\",\"cd /home/acmeco/bench && sudo -u acmeco bench restart\"]" \
   --profile "$PROFILE" \
   --region "$REGION" \
   --query 'Command.CommandId' \
